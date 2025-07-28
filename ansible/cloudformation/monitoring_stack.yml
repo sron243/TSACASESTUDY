@@ -1,0 +1,397 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/aws/aws-sam-cli/master/samcli/local/schema/schema.json
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Cloud-Based Disk Monitoring Solution Infrastructure'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging, development]
+    Description: Environment name
+  
+  MonitoringNamespace:
+    Type: String
+    Default: DiskMonitoring
+    Description: CloudWatch namespace for monitoring metrics
+  
+  AlertEmail:
+    Type: String
+    Default: admin@company.com
+    Description: Email address for disk usage alerts
+  
+  SlackWebhookUrl:
+    Type: String
+    Default: ''
+    Description: Slack webhook URL for notifications (optional)
+  
+  PagerDutyApiKey:
+    Type: String
+    Default: ''
+    Description: PagerDuty API key for alerts (optional)
+  
+  MonitoredAccounts:
+    Type: CommaDelimitedList
+    Default: []
+    Description: List of AWS account IDs to monitor
+  
+  CrossAccountRoleName:
+    Type: String
+    Default: DiskMonitoringRole
+    Description: Name of the cross-account IAM role
+  
+  DiskThresholdWarning:
+    Type: Number
+    Default: 80
+    Description: Disk usage warning threshold (percentage)
+  
+  DiskThresholdCritical:
+    Type: Number
+    Default: 90
+    Description: Disk usage critical threshold (percentage)
+  
+  DiskThresholdEmergency:
+    Type: Number
+    Default: 95
+    Description: Disk usage emergency threshold (percentage)
+  
+  MonitoringInterval:
+    Type: Number
+    Default: 300
+    Description: Monitoring interval in seconds
+
+Resources:
+  # SNS Topic for Alerts
+  DiskMonitoringSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'disk-monitoring-${Environment}'
+      DisplayName: !Sub 'Disk Monitoring Alerts - ${Environment}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DiskMonitoring
+
+  # SNS Subscription for Email
+  DiskMonitoringSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DiskMonitoringSNSTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # IAM Role for Lambda Functions
+  DiskMonitoringLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'disk-monitoring-lambda-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+      Policies:
+        - PolicyName: CrossAccountAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::*:role/${CrossAccountRoleName}'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref DiskMonitoringSNSTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # IAM Role for CloudWatch Agent
+  CloudWatchAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'cloudwatch-agent-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: DiskMonitoringAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # IAM Instance Profile for CloudWatch Agent
+  CloudWatchAgentInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub 'cloudwatch-agent-${Environment}'
+      Roles:
+        - !Ref CloudWatchAgentRole
+
+  # Lambda Function for Data Collection
+  DiskMonitoringLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'disk-monitoring-collector-${Environment}'
+      Runtime: python3.9
+      Handler: disk_monitoring_lambda.lambda_handler
+      Role: !GetAtt DiskMonitoringLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          MONITORING_NAMESPACE: !Ref MonitoringNamespace
+          LOG_RETENTION_DAYS: '30'
+          ALERT_THRESHOLD_WARNING: !Ref DiskThresholdWarning
+          ALERT_THRESHOLD_CRITICAL: !Ref DiskThresholdCritical
+          ALERT_THRESHOLD_EMERGENCY: !Ref DiskThresholdEmergency
+          SNS_TOPIC_ARN: !Ref DiskMonitoringSNSTopic
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+          PAGERDUTY_API_KEY: !Ref PagerDutyApiKey
+          CENTRAL_ACCOUNT_ID: !Ref AWS::AccountId
+          CROSS_ACCOUNT_ROLE_NAME: !Ref CrossAccountRoleName
+          MONITORED_ACCOUNTS: !Join [',', !Ref MonitoredAccounts]
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Disk monitoring function deployed')
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DiskMonitoring
+
+  # CloudWatch Log Group for Lambda
+  DiskMonitoringLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/disk-monitoring-collector-${Environment}'
+      RetentionInDays: 30
+
+  # CloudWatch Log Group for Disk Monitoring
+  DiskMonitoringMetricsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/disk-monitoring/${Environment}'
+      RetentionInDays: 30
+
+  # EventBridge Rule to Trigger Lambda
+  DiskMonitoringEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'disk-monitoring-schedule-${Environment}'
+      Description: 'Triggers disk monitoring Lambda function'
+      ScheduleExpression: !Sub 'rate(${MonitoringInterval} seconds)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DiskMonitoringLambda.Arn
+          Id: DiskMonitoringTarget
+
+  # Lambda Permission for EventBridge
+  DiskMonitoringLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DiskMonitoringLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DiskMonitoringEventRule.Arn
+
+  # Systems Manager Document for Disk Monitoring
+  DiskMonitoringSSMDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub 'disk-monitoring-script-${Environment}'
+      DocumentType: Command
+      Content:
+        schemaVersion: '2.2'
+        description: 'Disk monitoring script for AWS Cloud-Based Disk Monitoring Solution'
+        parameters:
+          threshold_warning:
+            type: String
+            default: !Ref DiskThresholdWarning
+            description: 'Warning threshold percentage'
+          threshold_critical:
+            type: String
+            default: !Ref DiskThresholdCritical
+            description: 'Critical threshold percentage'
+        mainSteps:
+          - action: aws:runShellScript
+            name: diskMonitoring
+            inputs:
+              runCommand:
+                - |
+                  #!/bin/bash
+                  # Disk Monitoring Script
+                  THRESHOLD_WARNING={{ threshold_warning }}
+                  THRESHOLD_CRITICAL={{ threshold_critical }}
+                  
+                  # Check disk usage
+                  DISK_USAGE=$(df -h / | awk 'NR==2 {print $5}' | sed 's/%//')
+                  
+                  echo "Disk usage: ${DISK_USAGE}%"
+                  
+                  if [ "$DISK_USAGE" -ge "$THRESHOLD_CRITICAL" ]; then
+                    echo "CRITICAL: Disk usage is ${DISK_USAGE}%"
+                    exit 2
+                  elif [ "$DISK_USAGE" -ge "$THRESHOLD_WARNING" ]; then
+                    echo "WARNING: Disk usage is ${DISK_USAGE}%"
+                    exit 1
+                  else
+                    echo "OK: Disk usage is ${DISK_USAGE}%"
+                    exit 0
+                  fi
+
+  # CloudWatch Dashboard
+  DiskMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'DiskMonitoring-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${MonitoringNamespace}", "disk_used_percent", "InstanceId", "*"],
+                  [".", "disk_used_percent", ".", ".", {"stat": "Average"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Disk Usage by Instance",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${MonitoringNamespace}/Aggregated", "TotalInstancesMonitored"],
+                  [".", "TotalAlertsGenerated"],
+                  [".", "AccountsMonitored"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Monitoring Summary",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  DiskUsageWarningAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'disk-usage-warning-${Environment}'
+      AlarmDescription: 'Disk usage warning threshold exceeded'
+      MetricName: disk_used_percent
+      Namespace: !Ref MonitoringNamespace
+      Statistic: Average
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: !Ref DiskThresholdWarning
+      Period: !Ref MonitoringInterval
+      EvaluationPeriods: 2
+      AlarmActions:
+        - !Ref DiskMonitoringSNSTopic
+      TreatMissingData: notBreaching
+
+  DiskUsageCriticalAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'disk-usage-critical-${Environment}'
+      AlarmDescription: 'Critical disk usage threshold exceeded'
+      MetricName: disk_used_percent
+      Namespace: !Ref MonitoringNamespace
+      Statistic: Average
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: !Ref DiskThresholdCritical
+      Period: !Ref MonitoringInterval
+      EvaluationPeriods: 1
+      AlarmActions:
+        - !Ref DiskMonitoringSNSTopic
+      TreatMissingData: notBreaching
+
+  DiskUsageEmergencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'disk-usage-emergency-${Environment}'
+      AlarmDescription: 'Emergency disk usage threshold exceeded'
+      MetricName: disk_used_percent
+      Namespace: !Ref MonitoringNamespace
+      Statistic: Average
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: !Ref DiskThresholdEmergency
+      Period: !Ref MonitoringInterval
+      EvaluationPeriods: 1
+      AlarmActions:
+        - !Ref DiskMonitoringSNSTopic
+      TreatMissingData: notBreaching
+
+Outputs:
+  SNSTopicArn:
+    Description: 'SNS Topic ARN for disk monitoring alerts'
+    Value: !Ref DiskMonitoringSNSTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  LambdaFunctionArn:
+    Description: 'Lambda function ARN for disk monitoring'
+    Value: !GetAtt DiskMonitoringLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  CloudWatchAgentRoleArn:
+    Description: 'IAM role ARN for CloudWatch agent'
+    Value: !GetAtt CloudWatchAgentRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchAgentRoleArn'
+
+  CloudWatchAgentInstanceProfileArn:
+    Description: 'IAM instance profile ARN for CloudWatch agent'
+    Value: !GetAtt CloudWatchAgentInstanceProfile.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchAgentInstanceProfileArn'
+
+  DashboardUrl:
+    Description: 'CloudWatch dashboard URL'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=DiskMonitoring-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardUrl' 

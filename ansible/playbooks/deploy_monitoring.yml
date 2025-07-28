@@ -1,0 +1,242 @@
+---
+# Main Deployment Playbook for AWS Cloud-Based Disk Monitoring Solution
+# This playbook deploys the complete monitoring infrastructure across multiple AWS accounts
+
+- name: Deploy AWS Cloud-Based Disk Monitoring Solution
+  hosts: all
+  gather_facts: true
+  become: true
+  
+  vars:
+    # Global configuration
+    monitoring_namespace: "DiskMonitoring"
+    log_retention_days: 30
+    cross_account_role: "DiskMonitoringRole"
+    
+    # Thresholds
+    disk_threshold_warning: "{{ disk_threshold_warning | default(80) }}"
+    disk_threshold_critical: "{{ disk_threshold_critical | default(90) }}"
+    disk_threshold_emergency: "{{ disk_threshold_emergency | default(95) }}"
+    
+    # Monitoring intervals (in seconds)
+    monitoring_interval: "{{ monitoring_interval | default(300) }}"
+    
+    # Alert configuration
+    alert_email: "{{ alert_email | default('admin@company.com') }}"
+    alert_channels: "{{ alert_channels | default(['email']) }}"
+    
+    # Environment-specific settings
+    environment: "{{ environment | default('production') }}"
+    
+  pre_tasks:
+    - name: Verify AWS connectivity
+      aws_caller_info:
+      register: aws_info
+      delegate_to: localhost
+      
+    - name: Display AWS account information
+      debug:
+        msg: "Connected to AWS Account: {{ aws_info.account }} in region {{ aws_info.region }}"
+        
+    - name: Verify instance metadata
+      uri:
+        url: "http://169.254.169.254/latest/meta-data/instance-id"
+        method: GET
+      register: instance_metadata
+      delegate_to: localhost
+      ignore_errors: true
+      
+    - name: Display instance information
+      debug:
+        msg: "Instance ID: {{ instance_metadata.json | default('Not available') }}"
+        
+  roles:
+    - role: aws_ssm_agent
+      vars:
+        ssm_test_connectivity: yes
+        cross_account_access: "{{ environment == 'production' }}"
+        
+    - role: cloudwatch_agent
+      vars:
+        cross_account_monitoring: "{{ environment == 'production' }}"
+        
+    - role: disk_monitor
+      vars:
+        disk_monitoring_enabled: yes
+        cloudwatch_integration: yes
+        
+  tasks:
+    - name: Configure IAM roles for CloudWatch access
+      aws_iam_role:
+        name: "CloudWatchAgentRole"
+        assume_role_policy: "{{ lookup('template', 'iam/cloudwatch-assume-role-policy.json.j2') }}"
+        managed_policy:
+          - "CloudWatchAgentServerPolicy"
+        state: present
+      delegate_to: localhost
+      
+    - name: Attach CloudWatch Agent role to instance
+      aws_ec2_instance:
+        instance_ids: "{{ instance_metadata.json }}"
+        instance_profile_name: "CloudWatchAgentRole"
+      delegate_to: localhost
+      when: instance_metadata.json is defined
+      
+    - name: Create CloudWatch log group
+      aws_cloudwatch_log_group:
+        name: "/aws/disk-monitoring/{{ environment }}"
+        retention: "{{ log_retention_days }}"
+        state: present
+      delegate_to: localhost
+      
+    - name: Configure CloudWatch alarms for disk usage
+      aws_cloudwatch_metric_alarm:
+        name: "DiskUsageWarning-{{ inventory_hostname }}"
+        metric: "disk_used_percent"
+        namespace: "{{ monitoring_namespace }}"
+        statistic: Average
+        comparison: ">="
+        threshold: "{{ disk_threshold_warning }}"
+        period: "{{ monitoring_interval }}"
+        evaluation_periods: 2
+        alarm_description: "Disk usage warning threshold exceeded"
+        alarm_actions: "{{ sns_topic_arn | default(omit) }}"
+        state: present
+      delegate_to: localhost
+      
+    - name: Configure CloudWatch alarms for critical disk usage
+      aws_cloudwatch_metric_alarm:
+        name: "DiskUsageCritical-{{ inventory_hostname }}"
+        metric: "disk_used_percent"
+        namespace: "{{ monitoring_namespace }}"
+        statistic: Average
+        comparison: ">="
+        threshold: "{{ disk_threshold_critical }}"
+        period: "{{ monitoring_interval }}"
+        evaluation_periods: 1
+        alarm_description: "Critical disk usage threshold exceeded"
+        alarm_actions: "{{ sns_topic_arn | default(omit) }}"
+        state: present
+      delegate_to: localhost
+      
+    - name: Configure CloudWatch alarms for emergency disk usage
+      aws_cloudwatch_metric_alarm:
+        name: "DiskUsageEmergency-{{ inventory_hostname }}"
+        metric: "disk_used_percent"
+        namespace: "{{ monitoring_namespace }}"
+        statistic: Average
+        comparison: ">="
+        threshold: "{{ disk_threshold_emergency }}"
+        period: "{{ monitoring_interval }}"
+        evaluation_periods: 1
+        alarm_description: "Emergency disk usage threshold exceeded"
+        alarm_actions: "{{ sns_topic_arn | default(omit) }}"
+        state: present
+      delegate_to: localhost
+      
+    - name: Create Systems Manager document for disk monitoring
+      aws_ssm_document:
+        name: "DiskMonitoringScript"
+        document_type: Command
+        content: "{{ lookup('template', 'ssm/disk-monitoring-document.json.j2') }}"
+        state: present
+      delegate_to: localhost
+      
+    - name: Schedule periodic disk monitoring via Systems Manager
+      aws_ssm_maintenance_window:
+        name: "DiskMonitoringWindow"
+        schedule: "rate({{ monitoring_interval }} seconds)"
+        duration: 3600
+        cutoff: 300
+        state: present
+      delegate_to: localhost
+      
+    - name: Register targets for maintenance window
+      aws_ssm_maintenance_window_target:
+        window_id: "{{ maintenance_window_id }}"
+        resource_type: INSTANCE
+        targets:
+          - key: "tag:Environment"
+            values: "{{ environment }}"
+        state: present
+      delegate_to: localhost
+      
+    - name: Register tasks for maintenance window
+      aws_ssm_maintenance_window_task:
+        window_id: "{{ maintenance_window_id }}"
+        task_type: RUN_COMMAND
+        task_arn: "AWS-RunShellScript"
+        service_role_arn: "{{ ssm_automation_role_arn }}"
+        targets:
+          - key: "WindowTargetIds"
+            values: "{{ window_target_ids }}"
+        task_parameters:
+          commands:
+            - "/opt/disk_monitor/disk_check.sh"
+        state: present
+      delegate_to: localhost
+      
+  post_tasks:
+    - name: Verify monitoring deployment
+      block:
+        - name: Check SSM Agent status
+          systemd:
+            name: amazon-ssm-agent
+          register: ssm_status
+            
+        - name: Check CloudWatch Agent status
+          systemd:
+            name: amazon-cloudwatch-agent
+          register: cw_status
+            
+        - name: Check disk monitoring script
+          stat:
+            path: /opt/disk_monitor/disk_check.sh
+          register: script_status
+            
+        - name: Display deployment status
+          debug:
+            msg: |
+              Deployment Status:
+              - SSM Agent: {{ 'Running' if ssm_status.status.ActiveState == 'active' else 'Not Running' }}
+              - CloudWatch Agent: {{ 'Running' if cw_status.status.ActiveState == 'active' else 'Not Running' }}
+              - Disk Monitoring Script: {{ 'Present' if script_status.stat.exists else 'Missing' }}
+              
+    - name: Test disk monitoring functionality
+      command: /opt/disk_monitor/disk_check.sh
+      register: test_result
+      changed_when: false
+      
+    - name: Display test results
+      debug:
+        msg: "Disk monitoring test completed with exit code: {{ test_result.rc }}"
+        
+    - name: Generate deployment report
+      template:
+        src: deployment-report.j2
+        dest: "/tmp/deployment-report-{{ inventory_hostname }}.txt"
+        mode: '0644'
+      delegate_to: localhost
+      
+    - name: Display deployment summary
+      debug:
+        msg: |
+          ========================================
+          AWS Cloud-Based Disk Monitoring Solution
+          ========================================
+          
+          Environment: {{ environment }}
+          Instance: {{ inventory_hostname }}
+          Region: {{ aws_info.region }}
+          Account: {{ aws_info.account }}
+          
+          Monitoring Configuration:
+          - Warning Threshold: {{ disk_threshold_warning }}%
+          - Critical Threshold: {{ disk_threshold_critical }}%
+          - Emergency Threshold: {{ disk_threshold_emergency }}%
+          - Monitoring Interval: {{ monitoring_interval }} seconds
+          
+          Alert Channels: {{ alert_channels | join(', ') }}
+          
+          Deployment completed successfully!
+          ======================================== 

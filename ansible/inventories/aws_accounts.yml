@@ -1,0 +1,135 @@
+---
+# AWS Multi-Account Inventory Configuration
+# This inventory supports dynamic discovery of EC2 instances across multiple AWS accounts
+
+plugin: aws_ec2
+regions:
+  - us-east-1
+  - us-west-2
+  - eu-west-1
+  - ap-southeast-1
+
+# AWS Account Configurations
+aws_accounts:
+  - account_id: "123456789012"
+    account_name: "production"
+    environment: "prod"
+    regions: ["us-east-1", "us-west-2"]
+    tags:
+      Environment: production
+      Owner: "platform-team"
+      CostCenter: "platform"
+    
+  - account_id: "234567890123"
+    account_name: "staging"
+    environment: "staging"
+    regions: ["us-east-1"]
+    tags:
+      Environment: staging
+      Owner: "dev-team"
+      CostCenter: "development"
+    
+  - account_id: "345678901234"
+    account_name: "development"
+    environment: "dev"
+    regions: ["us-east-1"]
+    tags:
+      Environment: development
+      Owner: "dev-team"
+      CostCenter: "development"
+
+# Instance filtering
+filters:
+  instance-state-name: running
+  tag:Environment: production
+
+# Group by tags
+keyed_groups:
+  - key: tags.Environment
+    prefix: env
+  - key: tags.Owner
+    prefix: owner
+  - key: tags.CostCenter
+    prefix: costcenter
+  - key: instance_type
+    prefix: type
+  - key: placement.region
+    prefix: region
+  - key: placement.availability_zone
+    prefix: az
+
+# Host variables
+hostvars:
+  ansible_user: ec2-user
+  ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+  ansible_python_interpreter: /usr/bin/python3
+
+# Group variables
+groups:
+  webservers:
+    vars:
+      disk_threshold_warning: 80
+      disk_threshold_critical: 90
+      monitoring_interval: 300
+      alert_email: "web-admin@company.com"
+  
+  databases:
+    vars:
+      disk_threshold_warning: 75
+      disk_threshold_critical: 85
+      monitoring_interval: 180
+      alert_email: "dba@company.com"
+  
+  monitoring:
+    vars:
+      disk_threshold_warning: 70
+      disk_threshold_critical: 80
+      monitoring_interval: 120
+      alert_email: "monitoring@company.com"
+  
+  production:
+    vars:
+      environment: production
+      monitoring_interval: 300
+      alert_channels: ["email", "slack", "pagerduty"]
+  
+  staging:
+    vars:
+      environment: staging
+      monitoring_interval: 600
+      alert_channels: ["email", "slack"]
+  
+  development:
+    vars:
+      environment: development
+      monitoring_interval: 900
+      alert_channels: ["email"]
+
+# Cross-account access configuration
+cross_account:
+  central_account: "123456789012"
+  role_name: "DiskMonitoringRole"
+  session_duration: 3600
+  external_id: "disk-monitoring-solution"
+
+# CloudWatch configuration
+cloudwatch:
+  namespace: "DiskMonitoring"
+  retention_days: 30
+  log_group: "/aws/disk-monitoring"
+  
+# Systems Manager configuration
+ssm:
+  document_name: "DiskMonitoringScript"
+  automation_role: "SSMAutomationRole"
+  max_concurrency: 10
+  max_errors: 5
+
+# Lambda configuration
+lambda:
+  runtime: python3.9
+  timeout: 300
+  memory_size: 512
+  environment:
+    LOG_LEVEL: INFO
+    RETENTION_DAYS: 30 
